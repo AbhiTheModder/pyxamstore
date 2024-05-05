@@ -26,8 +26,9 @@ documentation = "https://github.com/jakev/pyxamstore"
 
 [tool.poetry.dependencies]
 python = "^3.6"
-lz4 = "^4.3"
-xxhash = "^3.4"
+lz4
+xxhash
+future
 
 [tool.poetry.dev-dependencies]
 
