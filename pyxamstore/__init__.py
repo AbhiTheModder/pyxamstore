@@ -247,7 +247,7 @@ class AssemblyStore(object):
 
             i += 1
 
-    def extract_all(self, json_config, outpath="out"):
+    def extract_all(self, json_config, outpath):
 
         """Extract everything"""
 
@@ -414,12 +414,14 @@ def do_unpack(in_directory, in_arch, force):
     """Unpack a assemblies.blob/manifest"""
 
     arch_assemblies = False
+    in_directory = os.path.abspath(in_directory)
+    out_directory = os.path.join(in_directory, "out")
 
-    if force and os.path.isdir("out/"):
-        shutil.rmtree("out/")
+    if force and os.path.isdir(out_directory):
+        shutil.rmtree(out_directory)
 
     # First check if all files exist.
-    if os.path.isdir("out/"):
+    if os.path.isdir(out_directory):
         print("Out directory already exists!")
         return 3
 
@@ -446,7 +448,7 @@ def do_unpack(in_directory, in_arch, force):
     json_data['stores'] = list()
     json_data['assemblies'] = list()
 
-    os.mkdir("out/")
+    os.mkdir(out_directory)
 
     assembly_store = AssemblyStore(assemblies_path, manifest_entries)
 
@@ -455,7 +457,7 @@ def do_unpack(in_directory, in_arch, force):
         debug("There are more assemblies to unpack here!")
 
     # Do extraction.
-    json_data = assembly_store.extract_all(json_data)
+    json_data = assembly_store.extract_all(json_data, out_directory)
 
     # What about architecture assemblies?
     if arch_assemblies:
@@ -465,10 +467,10 @@ def do_unpack(in_directory, in_arch, force):
         arch_assembly_store = AssemblyStore(arch_assemblies_path,
                                             manifest_entries,
                                             primary=False)
-        json_data = arch_assembly_store.extract_all(json_data)
+        json_data = arch_assembly_store.extract_all(json_data, out_directory)
 
     # Save the large config out.
-    with open(constants.FILE_ASSEMBLIES_JSON, 'w') as assembly_file:
+    with open(os.path.join(in_directory, constants.FILE_ASSEMBLIES_JSON), 'w') as assembly_file:
         assembly_file.write(json.dumps(json_data, indent=4))
 
 def do_pack(in_json_config):
