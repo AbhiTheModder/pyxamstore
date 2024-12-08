@@ -136,8 +136,7 @@ class AssemblyStore(object):
 
         version = struct.unpack("I", blob_file.read(4))[0]
         if version > constants.ASSEMBLY_STORE_FORMAT_VERSION:
-            raise Exception("This version is higher than expected! Max = %d, got %d"
-                            % constants.ASSEMBLY_STORE_FORMAT_VERSION, version)
+            raise Exception(f"This version is higher than expected! Max = {constants.ASSEMBLY_STORE_FORMAT_VERSION}, got {version}")
 
         self.hdr_version = version
 
