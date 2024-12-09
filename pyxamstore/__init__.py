@@ -12,7 +12,8 @@ import struct
 import sys
 import lz4.block
 
-#TODO: Add support for ARM
+# TODO: Add support for ARM
+
 
 # https://github.com/dotnet/android/blob/04340244c3cb1753a987b6809a91631dc883b035/tools/assembly-store-reader-mk2/AssemblyStore/StoreReader_V2.Classes.cs#L21
 class Header:
@@ -252,7 +253,7 @@ def update_payload(config_file, payload_path, assembly_folder):
                 # '<assembly_store>' is larger than when the
                 # application was built (expected at most 2560, got
                 # 1893376). Assemblies don't grow just like that!'
-                #TODO: Maybe support upto some size ?
+                # TODO: Maybe support upto some size ?
                 if len(assembly_data) > info["size"]:
                     print(f"Error: {assembly} exceeds the allocated size. Skipping.")
                     continue
@@ -300,23 +301,23 @@ def unpack_elf(elf_path, out="out", payload="payload.bin"):
     return
 
 
-if __name__ == "__main__":
-    argparse = argparse.ArgumentParser()
-    argparse.add_argument("--elf", help="Path to the input ELF file")
-    argparse.add_argument("--unpack", action="store_true", help="Unpack the ELF file")
-    argparse.add_argument(
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--elf", help="Path to the input ELF file")
+    parser.add_argument("--unpack", action="store_true", help="Unpack the ELF file")
+    parser.add_argument(
         "--pack",
         metavar=("ELF_PATH", "PAYLOAD_PATH", "OUTPUT_ELF_PATH"),
         nargs=3,
         help="Pack the ELF file with a new payload",
     )
-    argparse.add_argument(
+    parser.add_argument(
         "--update",
         metavar=("CONFIG_FILE", "PAYLOAD_PATH", "ASSEMBLY_FOLDER"),
         nargs=3,
         help="Update the payload with modified assembly files",
     )
-    args = argparse.parse_args()
+    args = parser.parse_args()
 
     if args.unpack:
         if not args.elf:
@@ -330,3 +331,8 @@ if __name__ == "__main__":
         update_payload(args.update[0], args.update[1], args.update[2])
     else:
         print("Please specify either --unpack, --pack, or --update.")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
