@@ -251,6 +251,7 @@ def update_payload(config_file, payload_path, assembly_folder):
                 # '<assembly_store>' is larger than when the
                 # application was built (expected at most 2560, got
                 # 1893376). Assemblies don't grow just like that!'
+                #TODO: Maybe support upto some size ?
                 if len(assembly_data) > info["size"]:
                     print(f"Error: {assembly} exceeds the allocated size. Skipping.")
                     continue
