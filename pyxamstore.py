@@ -3,7 +3,7 @@
 # -*- coding: utf-8 -*-
 # @author: Abhi (@AbhiTheModder)
 
-"""Pack and unpack Xamarin AssemblyStore files"""
+"""Pack and unpack Xamarin AssemblyStoreV2 files"""
 
 import argparse
 import json
@@ -12,6 +12,7 @@ import struct
 import sys
 import lz4.block
 
+#TODO: Add support for ARM
 
 # https://github.com/dotnet/android/blob/04340244c3cb1753a987b6809a91631dc883b035/tools/assembly-store-reader-mk2/AssemblyStore/StoreReader_V2.Classes.cs#L21
 class Header:
