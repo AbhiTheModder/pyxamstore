@@ -11,8 +11,12 @@ import os
 import struct
 import sys
 import lz4.block
+from elftools.elf.elffile import ELFFile
 
-# TODO: Add support for ARM
+
+# https://github.com/dotnet/android/blob/04340244c3cb1753a987b6809a91631dc883b035/tools/assembly-store-reader-mk2/AssemblyStore/StoreReader_V2.cs#L14
+ASSEMBLY_STORE_ABI_AARCH64 = 0x80010002
+ASSEMBLY_STORE_ABI_ARM = 0x20002
 
 
 # https://github.com/dotnet/android/blob/04340244c3cb1753a987b6809a91631dc883b035/tools/assembly-store-reader-mk2/AssemblyStore/StoreReader_V2.Classes.cs#L21
@@ -37,8 +41,11 @@ class IndexEntry:
     Index entry of AssemblyStore
     """
 
-    def __init__(self, data):
-        self.name_hash, self.descriptor_index = struct.unpack("<QI", data)
+    def __init__(self, data, is64Bit):
+        if is64Bit:
+            self.name_hash, self.descriptor_index = struct.unpack("<QI", data)
+        else:
+            self.name_hash, self.descriptor_index = struct.unpack("<II", data)
 
 
 # https://github.com/dotnet/android/blob/04340244c3cb1753a987b6809a91631dc883b035/tools/assembly-store-reader-mk2/AssemblyStore/StoreReader_V2.Classes.cs#L43
@@ -65,52 +72,25 @@ def extract_payload(elf_path, output_file_path):
     """
 
     with open(elf_path, "rb") as elf_file:
-        # Read the ELF header
-        elf_header = elf_file.read(64)
-        e_shoff = struct.unpack_from("<Q", elf_header, 40)[0]
-        e_shnum = struct.unpack_from("<H", elf_header, 60)[0]
-        e_shentsize = struct.unpack_from("<H", elf_header, 58)[0]
-        e_shstrndx = struct.unpack_from("<H", elf_header, 62)[0]
-
-        elf_file.seek(e_shoff)
-        section_headers = elf_file.read(e_shnum * e_shentsize)
-
-        shstrtab_offset = struct.unpack_from(
-            "<Q", section_headers, e_shstrndx * e_shentsize + 24
-        )[0]
-        shstrtab_size = struct.unpack_from(
-            "<Q", section_headers, e_shstrndx * e_shentsize + 32
-        )[0]
-        elf_file.seek(shstrtab_offset)
-        shstrtab = elf_file.read(shstrtab_size)
-
-        payload_offset = None
-        payload_size = None
-        for i in range(e_shnum):
-            sh_name_offset = struct.unpack_from(
-                "<I", section_headers, i * e_shentsize + 0
-            )[0]
-            section_name = shstrtab[sh_name_offset:].split(b"\x00", 1)[0]
-            if section_name == b"payload":
-                payload_offset = struct.unpack_from(
-                    "<Q", section_headers, i * e_shentsize + 24
-                )[0]
-                payload_size = struct.unpack_from(
-                    "<Q", section_headers, i * e_shentsize + 32
-                )[0]
-                break
-
-        if payload_offset is None or payload_size is None:
-            raise ValueError("Payload section not found in the ELF file")
-
-        elf_file.seek(payload_offset)
-        payload_data = elf_file.read(payload_size)
-
+        elf = ELFFile(elf_file)
+        payload = elf.get_section_by_name("payload")
+        if payload is None:
+            print("No .payload section found")
+            exit(1)
+        if elf.header.e_machine == "EM_AARCH64":
+            is64Bit = True
+        elif elf.header.e_machine == "EM_ARM":
+            is64Bit = False
+        else:
+            print("Unsupported architecture")  # For now
+            exit(1)
+        payload_data = payload.data()
         with open(output_file_path, "wb") as output_file:
             output_file.write(payload_data)
+        return is64Bit
 
 
-def extract_assemblies(payload_path):
+def extract_assemblies(payload_path, is64Bit):
     """
     Extract assemblies from payload
     """
@@ -122,8 +102,8 @@ def extract_assemblies(payload_path):
 
         index_entries = []
         for _ in range(header.index_entry_count):
-            index_entry_data = payload_file.read(12)
-            index_entry = IndexEntry(index_entry_data)
+            index_entry_data = payload_file.read(12 if is64Bit else 8)
+            index_entry = IndexEntry(index_entry_data, is64Bit)
             index_entries.append(index_entry)
 
         entry_descriptors = []
@@ -171,23 +151,44 @@ def pack_elf(elf_path, payload_path, output_elf_path):
     """
     with open(elf_path, "rb") as elf_file:
         elf_data = elf_file.read()
+        elf = ELFFile(elf_file)
+        if elf.header.e_machine == "EM_AARCH64":
+            is64Bit = True
+        elif elf.header.e_machine == "EM_ARM":
+            is64Bit = False
+        else:
+            raise ValueError("Unsupported ELF architecture")
 
     with open(payload_path, "rb") as payload_file:
         payload_data = payload_file.read()
 
     elf_header = elf_data[:64]
-    e_shoff = struct.unpack_from("<Q", elf_header, 40)[0]
-    e_shnum = struct.unpack_from("<H", elf_header, 60)[0]
-    e_shentsize = struct.unpack_from("<H", elf_header, 58)[0]
-    e_shstrndx = struct.unpack_from("<H", elf_header, 62)[0]
+    if is64Bit:
+        e_shoff = struct.unpack_from("<Q", elf_header, 40)[0]
+        e_shnum = struct.unpack_from("<H", elf_header, 60)[0]
+        e_shentsize = struct.unpack_from("<H", elf_header, 58)[0]
+        e_shstrndx = struct.unpack_from("<H", elf_header, 62)[0]
+    else:
+        e_shoff = struct.unpack_from("<I", elf_header, 32)[0]
+        e_shnum = struct.unpack_from("<H", elf_header, 48)[0]
+        e_shentsize = struct.unpack_from("<H", elf_header, 46)[0]
+        e_shstrndx = struct.unpack_from("<H", elf_header, 50)[0]
 
     section_headers = elf_data[e_shoff : e_shoff + e_shnum * e_shentsize]
-    shstrtab_offset = struct.unpack_from(
-        "<Q", section_headers, e_shstrndx * e_shentsize + 24
-    )[0]
-    shstrtab_size = struct.unpack_from(
-        "<Q", section_headers, e_shstrndx * e_shentsize + 32
-    )[0]
+    if is64Bit:
+        shstrtab_offset = struct.unpack_from(
+            "<Q", section_headers, e_shstrndx * e_shentsize + 24
+        )[0]
+        shstrtab_size = struct.unpack_from(
+            "<Q", section_headers, e_shstrndx * e_shentsize + 32
+        )[0]
+    else:
+        shstrtab_offset = struct.unpack_from(
+            "<I", section_headers, e_shstrndx * e_shentsize + 16
+        )[0]
+        shstrtab_size = struct.unpack_from(
+            "<I", section_headers, e_shstrndx * e_shentsize + 20
+        )[0]
     shstrtab = elf_data[shstrtab_offset : shstrtab_offset + shstrtab_size]
 
     payload_offset = None
@@ -198,12 +199,20 @@ def pack_elf(elf_path, payload_path, output_elf_path):
         ]
         section_name = shstrtab[sh_name_offset:].split(b"\x00", 1)[0]
         if section_name == b"payload":
-            payload_offset = struct.unpack_from(
-                "<Q", section_headers, i * e_shentsize + 24
-            )[0]
-            payload_size = struct.unpack_from(
-                "<Q", section_headers, i * e_shentsize + 32
-            )[0]
+            if is64Bit:
+                payload_offset = struct.unpack_from(
+                    "<Q", section_headers, i * e_shentsize + 24
+                )[0]
+                payload_size = struct.unpack_from(
+                    "<Q", section_headers, i * e_shentsize + 32
+                )[0]
+            else:
+                payload_offset = struct.unpack_from(
+                    "<I", section_headers, i * e_shentsize + 16
+                )[0]
+                payload_size = struct.unpack_from(
+                    "<I", section_headers, i * e_shentsize + 20
+                )[0]
             break
 
     if payload_offset is None or payload_size is None:
@@ -267,21 +276,22 @@ def update_payload(config_file, payload_path, assembly_folder):
         print(f"An error occurred: {e}")
 
 
-def unpack_elf(elf_path, out="out", payload="payload.bin"):
-    """
-    Function to unpack and extract payload & assemblies from an ELF file
-    """
-    os.makedirs(out, exist_ok=True)
-    extract_payload(elf_path, payload)
-    print(f"Payload extracted to {payload}")
+def unpack_payload(payload_path):
     print("Verifying payload...")
-    with open(payload, "rb") as payload_file:
+    with open(payload_path, "rb") as payload_file:
         payload_data = payload_file.read()
         if payload_data[:4] == b"XABA":
             print("Payload is valid!")
+            arch_magic = int.from_bytes(payload_data[4:8], byteorder="little")
+            if arch_magic == ASSEMBLY_STORE_ABI_AARCH64:
+                is64Bit = True
+            elif arch_magic == ASSEMBLY_STORE_ABI_ARM:
+                is64Bit = False
+            else:
+                raise ValueError("Unknown architecture magic!")
         else:
             raise ValueError("Payload is not valid!")
-    assemblies, entry_descriptors = extract_assemblies(payload)
+    assemblies, entry_descriptors = extract_assemblies(payload_path, is64Bit)
     config_data = {}
     for i, assembly in enumerate(assemblies):
         with open(f"out/assembly_{i}.dll", "wb") as assembly_file:
@@ -301,6 +311,17 @@ def unpack_elf(elf_path, out="out", payload="payload.bin"):
     return
 
 
+def unpack_elf(elf_path, out="out", payload="payload.bin"):
+    """
+    Function to unpack and extract payload & assemblies from an ELF file
+    """
+    os.makedirs(out, exist_ok=True)
+    extract_payload(elf_path, payload)
+    print(f"Payload extracted to {payload}")
+    unpack_payload(payload)
+    return
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--elf", help="Path to the input ELF file")
@@ -317,6 +338,9 @@ def main():
         nargs=3,
         help="Update the payload with modified assembly files",
     )
+    parser.add_argument(
+        "--payload", metavar=("PAYLOAD_PATH"), nargs=1, help="Unpack payload"
+    )
     args = parser.parse_args()
 
     if args.unpack:
@@ -329,6 +353,8 @@ def main():
         pack_elf(args.pack[0], args.pack[1], args.pack[2])
     elif args.update:
         update_payload(args.update[0], args.update[1], args.update[2])
+    elif args.payload:
+        unpack_payload(args.payload[0])
     else:
         print("Please specify either --unpack, --pack, or --update.")
         sys.exit(1)
