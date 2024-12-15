@@ -13,6 +13,8 @@ import sys
 import lz4.block
 from elftools.elf.elffile import ELFFile
 
+# TODO: Add support for other archiitectures
+# No samples to work with for now
 
 # https://github.com/dotnet/android/blob/04340244c3cb1753a987b6809a91631dc883b035/tools/assembly-store-reader-mk2/AssemblyStore/StoreReader_V2.cs#L14
 ASSEMBLY_STORE_ABI_AARCH64 = 0x80010002
