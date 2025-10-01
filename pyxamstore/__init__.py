@@ -3,7 +3,7 @@
 # -*- coding: utf-8 -*-
 # @author: Abhi (@AbhiTheModder)
 
-"""Pack and unpack Xamarin AssemblyStoreV2 files"""
+"""Pack and unpack Xamarin AssemblyStoreV2 and AssemblyStoreV3 files"""
 
 import argparse
 import json
@@ -12,13 +12,6 @@ import struct
 import sys
 import lz4.block
 from elftools.elf.elffile import ELFFile
-
-# TODO: Add support for other archiitectures
-# No samples to work with for now
-
-# https://github.com/dotnet/android/blob/04340244c3cb1753a987b6809a91631dc883b035/tools/assembly-store-reader-mk2/AssemblyStore/StoreReader_V2.cs#L14
-ASSEMBLY_STORE_ABI_AARCH64 = 0x80010002
-ASSEMBLY_STORE_ABI_ARM = 0x20002
 
 
 # https://github.com/dotnet/android/blob/04340244c3cb1753a987b6809a91631dc883b035/tools/assembly-store-reader-mk2/AssemblyStore/StoreReader_V2.Classes.cs#L21
@@ -38,16 +31,31 @@ class Header:
 
 
 # https://github.com/dotnet/android/blob/04340244c3cb1753a987b6809a91631dc883b035/tools/assembly-store-reader-mk2/AssemblyStore/StoreReader_V2.Classes.cs#L31
+# V3 change: https://github.com/dotnet/android/commit/aac59125f4f21002ade246f25eb2daaeb7909eda
 class IndexEntry:
     """
     Index entry of AssemblyStore
     """
 
-    def __init__(self, data, is64Bit):
-        if is64Bit:
-            self.name_hash, self.descriptor_index = struct.unpack("<QI", data)
+    def __init__(self, data, is64Bit, version):
+        self.ignore = False
+        if version == 2:
+            if is64Bit:
+                self.name_hash, self.descriptor_index = struct.unpack("<QI", data)
+            else:
+                self.name_hash, self.descriptor_index = struct.unpack("<II", data)
+        elif version == 3:
+            if is64Bit:
+                self.name_hash, self.descriptor_index, ignore_byte = struct.unpack(
+                    "<QIB", data
+                )
+            else:
+                self.name_hash, self.descriptor_index, ignore_byte = struct.unpack(
+                    "<IIB", data
+                )
+            self.ignore = ignore_byte != 0
         else:
-            self.name_hash, self.descriptor_index = struct.unpack("<II", data)
+            raise ValueError(f"Unsupported AssemblyStore version: {version}")
 
 
 # https://github.com/dotnet/android/blob/04340244c3cb1753a987b6809a91631dc883b035/tools/assembly-store-reader-mk2/AssemblyStore/StoreReader_V2.Classes.cs#L43
@@ -92,7 +100,7 @@ def extract_payload(elf_path, output_file_path):
         return is64Bit
 
 
-def extract_assemblies(payload_path, is64Bit):
+def extract_assemblies(payload_path, is64Bit, version):
     """
     Extract assemblies from payload
     """
@@ -104,8 +112,15 @@ def extract_assemblies(payload_path, is64Bit):
 
         index_entries = []
         for _ in range(header.index_entry_count):
-            index_entry_data = payload_file.read(12 if is64Bit else 8)
-            index_entry = IndexEntry(index_entry_data, is64Bit)
+            if version == 2:
+                entry_size = 12 if is64Bit else 8
+            elif version == 3:
+                entry_size = 13 if is64Bit else 9
+            else:
+                raise ValueError(f"Unsupported AssemblyStore version: {version}")
+
+            index_entry_data = payload_file.read(entry_size)
+            index_entry = IndexEntry(index_entry_data, is64Bit, version)
             index_entries.append(index_entry)
 
         entry_descriptors = []
@@ -116,6 +131,10 @@ def extract_assemblies(payload_path, is64Bit):
 
         assemblies = []
         for descriptor in entry_descriptors:
+            if descriptor.data_size == 0:
+                assemblies.append(b"")
+                continue
+
             payload_file.seek(descriptor.data_offset)
             assembly_data = payload_file.read(descriptor.data_size)
             # print(descriptor.data_size, descriptor.data_offset)
@@ -130,7 +149,7 @@ def extract_assemblies(payload_path, is64Bit):
 
             assemblies.append(assembly_data)
 
-        return assemblies, entry_descriptors
+        return assemblies, entry_descriptors, index_entries
 
 
 def lz4_compress(file_data, desc_idx):
@@ -240,6 +259,10 @@ def update_payload(config_file, payload_path, assembly_folder):
 
         with open(payload_path, "r+b") as payload:
             for assembly, info in config.items():
+                if info.get("ignored", False):
+                    print(f"Skipping ignored assembly: {assembly}")
+                    continue
+
                 assembly_path = os.path.join(assembly_folder, assembly)
 
                 if not os.path.exists(assembly_path):
@@ -281,30 +304,45 @@ def update_payload(config_file, payload_path, assembly_folder):
 def unpack_payload(payload_path):
     print("Verifying payload...")
     with open(payload_path, "rb") as payload_file:
-        payload_data = payload_file.read()
-        if payload_data[:4] == b"XABA":
-            print("Payload is valid!")
-            arch_magic = int.from_bytes(payload_data[4:8], byteorder="little")
-            if arch_magic == ASSEMBLY_STORE_ABI_AARCH64:
-                is64Bit = True
-            elif arch_magic == ASSEMBLY_STORE_ABI_ARM:
-                is64Bit = False
-            else:
-                raise ValueError("Unknown architecture magic!")
-        else:
+        header_data = payload_file.read(20)
+        if header_data[:4] != b"XABA":
             raise ValueError("Payload is not valid!")
-    assemblies, entry_descriptors = extract_assemblies(payload_path, is64Bit)
-    config_data = {}
-    for i, assembly in enumerate(assemblies):
-        with open(f"out/assembly_{i}.dll", "wb") as assembly_file:
-            assembly_file.write(assembly)
 
-    for descriptor in entry_descriptors:
-        assembly_name = f"assembly_{descriptor.mapping_index}.dll"
+        print("Payload is valid!")
+        header = Header(header_data)
+
+        # The base version (2 or 3) is in the lowest byte.
+        version = header.version & 0xFF
+        is64Bit = (header.version & 0x80000000) != 0
+
+        if version not in [2, 3]:
+            raise ValueError(f"Unsupported AssemblyStore version: {version}")
+
+    print(
+        f"Detected AssemblyStore v{version} for {'64-bit' if is64Bit else '32-bit'} architecture."
+    )
+    assemblies, entry_descriptors, index_entries = extract_assemblies(
+        payload_path, is64Bit, version
+    )
+
+    is_ignored_map = {}
+    for entry in index_entries:
+        is_ignored_map[entry.descriptor_index] = entry.ignore
+
+    config_data = {}
+    for i, (assembly, descriptor) in enumerate(zip(assemblies, entry_descriptors)):
+        assembly_name = f"assembly_{i}.dll"
+        ignored = is_ignored_map.get(i, False)
+
+        if not ignored and assembly:
+            with open(os.path.join("out", assembly_name), "wb") as assembly_file:
+                assembly_file.write(assembly)
+
         config_data[assembly_name] = {
             "idx": descriptor.mapping_index,
             "offset": descriptor.data_offset,
             "size": descriptor.data_size,
+            "ignored": ignored,
         }
     with open(os.path.join("out", "assembly_config.json"), "w") as config_json:
         json.dump(config_data, config_json, indent=4)
