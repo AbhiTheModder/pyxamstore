@@ -10,6 +10,7 @@ import json
 import os
 import struct
 import sys
+
 import lz4.block
 from elftools.elf.elffile import ELFFile
 
@@ -130,17 +131,22 @@ def extract_assemblies(payload_path, is64Bit, version):
             entry_descriptors.append(entry_descriptor)
 
         assemblies = []
+        descriptor_indices = []
+
         for descriptor in entry_descriptors:
             if descriptor.data_size == 0:
                 assemblies.append(b"")
+                descriptor_indices.append(None)
                 continue
 
             payload_file.seek(descriptor.data_offset)
             assembly_data = payload_file.read(descriptor.data_size)
             # print(descriptor.data_size, descriptor.data_offset)
 
+            desc_idx = None
             # Unpack if LZ4 compressed
             if assembly_data[:4] == b"XALZ":
+                desc_idx = struct.unpack("<I", assembly_data[4:8])[0]
                 packed_payload_len = struct.unpack("<I", assembly_data[8:12])[0]
                 compressed_payload = assembly_data[12:]
                 assembly_data = lz4.block.decompress(
@@ -148,8 +154,9 @@ def extract_assemblies(payload_path, is64Bit, version):
                 )
 
             assemblies.append(assembly_data)
+            descriptor_indices.append(desc_idx)
 
-        return assemblies, entry_descriptors, index_entries
+        return assemblies, entry_descriptors, index_entries, descriptor_indices
 
 
 def lz4_compress(file_data, desc_idx):
@@ -321,8 +328,8 @@ def unpack_payload(payload_path):
     print(
         f"Detected AssemblyStore v{version} for {'64-bit' if is64Bit else '32-bit'} architecture."
     )
-    assemblies, entry_descriptors, index_entries = extract_assemblies(
-        payload_path, is64Bit, version
+    assemblies, entry_descriptors, index_entries, descriptor_indices = (
+        extract_assemblies(payload_path, is64Bit, version)
     )
 
     is_ignored_map = {}
@@ -330,7 +337,9 @@ def unpack_payload(payload_path):
         is_ignored_map[entry.descriptor_index] = entry.ignore
 
     config_data = {}
-    for i, (assembly, descriptor) in enumerate(zip(assemblies, entry_descriptors)):
+    for i, (assembly, descriptor, desc_idx) in enumerate(
+        zip(assemblies, entry_descriptors, descriptor_indices)
+    ):
         assembly_name = f"assembly_{i}.dll"
         ignored = is_ignored_map.get(i, False)
 
@@ -338,8 +347,9 @@ def unpack_payload(payload_path):
             with open(os.path.join("out", assembly_name), "wb") as assembly_file:
                 assembly_file.write(assembly)
 
+        idx_to_store = desc_idx if desc_idx is not None else descriptor.mapping_index
         config_data[assembly_name] = {
-            "idx": descriptor.mapping_index,
+            "idx": idx_to_store,
             "offset": descriptor.data_offset,
             "size": descriptor.data_size,
             "ignored": ignored,
