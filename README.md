@@ -1,6 +1,7 @@
 # Xamarin AssemblyStore Explorer (pyxamstore)
 
-> unpack and repack xamarin assemblies blob from `assemblies.blob` (V1) or payload libassemblies.<arch>.blob.so (V2/V3) format.
+> [!NOTE]
+> unpack and repack xamarin assemblies blob from `assemblies.blob` (V1) or payload `libassemblies.<arch>.blob.so` (V2/V3) format.
 
 ## Installing
 - Using `pip` [recommended]:
