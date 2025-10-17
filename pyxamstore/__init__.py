@@ -3,7 +3,7 @@
 # -*- coding: utf-8 -*-
 # @author: Abhi (@AbhiTheModder)
 
-"""Pack and unpack Xamarin AssemblyStoreV2 and AssemblyStoreV3 files"""
+"""Pack and unpack Xamarin AssemblyStore files"""
 
 import argparse
 import json
@@ -14,6 +14,8 @@ import sys
 
 import lz4.block as lz4
 from elftools.elf.elffile import ELFFile
+
+from .v1 import do_pack, do_unpack
 
 
 # https://github.com/dotnet/android/blob/04340244c3cb1753a987b6809a91631dc883b035/tools/assembly-store-reader-mk2/AssemblyStore/StoreReader_V2.Classes.cs#L21
@@ -324,7 +326,7 @@ def update_payload(config_file, payload_path, assembly_folder):
         print(f"An error occurred: {e}")
 
 
-def unpack_payload(payload_path: str, assembly_out: str):
+def unpack_payload(payload_path: str, assembly_out: str, arch: str | None = None):
     print("Verifying payload...")
     with open(payload_path, "rb") as payload_file:
         header_data = payload_file.read(20)
@@ -338,48 +340,63 @@ def unpack_payload(payload_path: str, assembly_out: str):
         version = header.version & 0xFF
         is64Bit = (header.version & 0x80000000) != 0
 
-        if version not in [2, 3]:
+        if version not in [1, 2, 3]:
             raise ValueError(f"Unsupported AssemblyStore version: {version}")
 
-    print(
-        f"Detected AssemblyStore v{version} for {'64-bit' if is64Bit else '32-bit'} architecture."
-    )
-    assemblies, entry_descriptors, index_entries, descriptor_indices, assembly_names = (
-        extract_assemblies(payload_path, is64Bit, version)
-    )
+    if version == 1:
+        print(f"Detected AssemblyStore v{version}.")
+        payload_dir = os.path.dirname(payload_path)
+        do_unpack(payload_dir, arch, True)
+    else:
+        print(
+            f"Detected AssemblyStore v{version} for {'64-bit' if is64Bit else '32-bit'} architecture."
+        )
+        (
+            assemblies,
+            entry_descriptors,
+            index_entries,
+            descriptor_indices,
+            assembly_names,
+        ) = extract_assemblies(payload_path, is64Bit, version)
 
-    is_ignored_map = {}
-    for entry in index_entries:
-        is_ignored_map[entry.descriptor_index] = entry.ignore
+        is_ignored_map = {}
+        for entry in index_entries:
+            is_ignored_map[entry.descriptor_index] = entry.ignore
 
-    config_data = {}
-    for i, (assembly, descriptor, desc_idx, real_name) in enumerate(
-        zip(assemblies, entry_descriptors, descriptor_indices, assembly_names)
-    ):
-        assembly_name = real_name if real_name else f"assembly_{i}.dll"
-        ignored = is_ignored_map.get(i, False)
+        config_data = {}
+        for i, (assembly, descriptor, desc_idx, real_name) in enumerate(
+            zip(assemblies, entry_descriptors, descriptor_indices, assembly_names)
+        ):
+            assembly_name = real_name if real_name else f"assembly_{i}.dll"
+            ignored = is_ignored_map.get(i, False)
 
-        if not ignored and assembly:
-            dest_path = os.path.join(assembly_out, assembly_name)
-            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-            with open(dest_path, "wb") as assembly_file:
-                assembly_file.write(assembly)
+            if not ignored and assembly:
+                dest_path = os.path.join(assembly_out, assembly_name)
+                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                with open(dest_path, "wb") as assembly_file:
+                    assembly_file.write(assembly)
 
-        idx_to_store = desc_idx if desc_idx is not None else descriptor.mapping_index
-        config_data[assembly_name] = {
-            "idx": idx_to_store,
-            "offset": descriptor.data_offset,
-            "size": descriptor.data_size,
-            "ignored": ignored,
-        }
-    with open(os.path.join(assembly_out, "assembly_config.json"), "w") as config_json:
-        json.dump(config_data, config_json, indent=4)
+            idx_to_store = (
+                desc_idx if desc_idx is not None else descriptor.mapping_index
+            )
+            config_data[assembly_name] = {
+                "idx": idx_to_store,
+                "offset": descriptor.data_offset,
+                "size": descriptor.data_size,
+                "ignored": ignored,
+            }
+        with open(
+            os.path.join(assembly_out, "assembly_config.json"), "w"
+        ) as config_json:
+            json.dump(config_data, config_json, indent=4)
 
     print("Assemblies extracted successfully!")
     return
 
 
-def unpack_elf(elf_path: pathlib.Path, out_dir: None | pathlib.Path = None):
+def unpack_elf(
+    elf_path: pathlib.Path, out_dir: None | pathlib.Path = None, arch: str | None = None
+):
     """
     Function to unpack and extract payload & assemblies from an ELF file
     """
@@ -389,12 +406,14 @@ def unpack_elf(elf_path: pathlib.Path, out_dir: None | pathlib.Path = None):
     payload_path = out_dir / "payload.bin"
     assembly_out = out_dir / "out"
 
-    os.makedirs(assembly_out, exist_ok=True)
+    if elf_path.name.endswith(".blob"):
+        payload_path = elf_path
+    else:
+        os.makedirs(assembly_out, exist_ok=True)
+        extract_payload(str(elf_path), str(payload_path))
+        print(f"Payload extracted to {payload_path}")
 
-    extract_payload(str(elf_path), str(payload_path))
-    print(f"Payload extracted to {payload_path}")
-
-    unpack_payload(str(payload_path), str(assembly_out))
+    unpack_payload(str(payload_path), str(assembly_out), arch)
 
     return out_dir
 
@@ -403,11 +422,14 @@ def main():
     parser = argparse.ArgumentParser(
         description="Pack/unpack Xamarin AssemblyStore payloads."
     )
-    parser.add_argument("elf_path", help="Path to the ELF file to operate on")
+    parser.add_argument(
+        "elf_path",
+        help="Path to the ELF file to operate on; in case of V1 format, it should be path to the assemblies.blob file.",
+    )
     parser.add_argument(
         "extracted_dir",
         nargs="?",
-        help="Directory created by a previous --unpack/-u (used for --pack/-p)",
+        help="Directory created by a previous --unpack/-u (used for --pack/-p); in case of V1 format, it should be path to the assemblies.json (config) file.",
     )
     parser.add_argument(
         "--out-path",
@@ -418,15 +440,21 @@ def main():
             "(default: overwrite original ELF)."
         ),
     )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--unpack", "-u", action="store_true", help="Extract payload & assemblies"
+    parser.add_argument(
+        "--arch",
+        "-r",
+        type=str,
+        metavar="val",
+        default="arm64",
+        help="Which architecture to unpack: arm(64), x86(_64) (default: arm64); Only to be used with V1 format. V2 & V3 format doesn't need this",
     )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--unpack", "-u", action="store_true", help="Extract assemblies")
     group.add_argument(
         "--pack",
         "-p",
         action="store_true",
-        help="Re‑pack payload & ELF from extracted_dir",
+        help="Re‑pack assemblies",
     )
 
     args = parser.parse_args()
@@ -434,13 +462,27 @@ def main():
 
     if args.unpack:
         elf_path = pathlib.Path(args.elf_path)
-        unpack_dir = unpack_elf(elf_path, out_path)
+        unpack_dir = unpack_elf(elf_path, out_path, args.arch)
         print(f"All files placed in: {unpack_dir}")
 
     elif args.pack:
         if not args.extracted_dir:
             parser.error("--pack/-p requires the extracted directory argument")
         extracted_path = pathlib.Path(args.extracted_dir)
+
+        if str(args.elf_path).endswith(".blob"):
+            with open(args.elf_path, "rb") as payload_file:
+                header_data = payload_file.read(20)
+                if header_data[:4] != b"XABA":
+                    raise ValueError("blob is not valid!")
+
+                header = Header(header_data)
+                version = header.version & 0xFF
+            if version == 1:
+                if not extracted_path.name.endswith(".json"):
+                    exit("extracted_path must be the path to config path for V1 format")
+                do_pack(str(extracted_path))
+                return
 
         payload_path = extracted_path / "payload.bin"
         config_path = extracted_path / "out" / "assembly_config.json"
