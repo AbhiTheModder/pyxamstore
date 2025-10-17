@@ -1,729 +1,503 @@
+#!/usr/bin/env python3
+
+# -*- coding: utf-8 -*-
+# @author: Abhi (@AbhiTheModder)
+
 """Pack and unpack Xamarin AssemblyStore files"""
 
-from __future__ import print_function
-from builtins import object
-import struct
 import argparse
-import os
-import os.path
-import sys
 import json
-import shutil
-
-import lz4.block
-import xxhash
-
-from . import constants
-
-# Enable debugging here.
-DEBUG = False
-
-def debug(message):
-
-    """Print a debuggable message"""
-
-    if DEBUG:
-        print("[debug] %s" % message)
-
-
-class ManifestEntry(object):
-
-    """Element in Manifest"""
-
-    hash32 = ""
-    hash64 = ""
-    blob_id = 0
-    blob_idx = 0
-    name = ""
-
-    def __init__(self, hash32, hash64, blob_id, blob_idx, name):
-
-        """Initialize item"""
-
-        self.hash32 = hash32
-        self.hash64 = hash64
-        self.blob_id = int(blob_id)
-        self.blob_idx = int(blob_idx)
-        self.name = name
-
-
-class ManifestList(list):
-
-    """List of manifest entries"""
-
-    def get_idx(self, blob_id, blob_idx):
-
-        """Find entry by ID"""
-
-        for entry in self:
-            if entry.blob_idx == blob_idx and entry.blob_id == blob_id:
-                return entry
-        return None
-
-
-class AssemblyStoreAssembly(object):
-
-    """Assembly Details"""
-
-    data_offset = 0
-    data_size = 0
-    debug_data_offset = 0
-    debug_data_size = 0
-    config_data_offset = 0
-    config_data_size = 0
-
-    def __init__(self):
-        pass
-
-
-class AssemblyStoreHashEntry(object):
-
-    """Hash Details"""
-
-    hash_val = ""
-    mapping_index = 0
-    local_store_index = 0
-    store_id = 0
-
-    def __init__(self):
-        pass
-
-
-class AssemblyStore(object):
-
-    """AssemblyStore object"""
-
-    raw = ""
-
-    file_name = ""
-
-    manifest_entries = None
-
-    hdr_magic = ""
-    hdr_version = 0
-    hdr_lec = 0
-    hdr_gec = 0
-    hdr_store_id = 0
-
-    assembly_list = None
-    global_hash32 = None
-    global_hash64 = None
-
-    def __init__(self, in_file_name, manifest_entries, primary=True):
-
-        """Parse and read store"""
-
-        self.manifest_entries = manifest_entries
-        self.file_name = os.path.basename(in_file_name)
-
-        blob_file = open(in_file_name, "rb")
-
-        self.raw = blob_file.read()
-
-        blob_file.seek(0)
-
-        # Header Section
-        #
-        # 0  -  3: Magic
-        # 4  -  7: Version
-        # 8  - 11: LocalEntryCount
-        # 12 - 15: GlobalEntryCount
-        # 16 - 19: StoreID
-
-        magic = blob_file.read(4)
-        if magic != constants.ASSEMBLY_STORE_MAGIC:
-            raise Exception("Invalid Magic: %s" % magic)
-
-        version = struct.unpack("I", blob_file.read(4))[0]
-        if version > constants.ASSEMBLY_STORE_FORMAT_VERSION:
-            raise Exception(f"This version is higher than expected! Max = {constants.ASSEMBLY_STORE_FORMAT_VERSION}, got {version}")
-
-        self.hdr_version = version
-
-        self.hdr_lec = struct.unpack("I", blob_file.read(4))[0]
-        self.hdr_gec = struct.unpack("I", blob_file.read(4))[0]
-        self.hdr_store_id = struct.unpack("I", blob_file.read(4))[0]
-
-        debug("Local entry count: %d" % self.hdr_lec)
-        debug("Global entry count: %d" % self.hdr_gec)
-
-        self.assemblies_list = list()
-
-        debug("Entries start at: %d (0x%x)" % (blob_file.tell(), blob_file.tell()))
-
-        i = 0
-        while i < self.hdr_lec:
-
-            #  0 -  3: DataOffset
-            #  4 -  7: DataSize
-            #  8 - 11: DebugDataOffset
-            # 12 - 15: DebugDataSize
-            # 16 - 19: ConfigDataOffset
-            # 20 - 23: ConfigDataSize
-
-            debug("Extracting Assembly: %d (0x%x)" % (blob_file.tell(), blob_file.tell()))
-            entry = blob_file.read(24)
-
-            assembly = AssemblyStoreAssembly()
-
-            assembly.data_offset = struct.unpack("I", entry[0:4])[0]
-            assembly.data_size = struct.unpack("I", entry[4:8])[0]
-            assembly.debug_data_offset = struct.unpack("I", entry[8:12])[0]
-            assembly.debug_data_size = struct.unpack("I", entry[12:16])[0]
-            assembly.config_data_offset = struct.unpack("I", entry[16:20])[0]
-            assembly.config_data_size = struct.unpack("I", entry[20:24])[0]
-
-            self.assemblies_list.append(assembly)
-
-            debug("  Data Offset: %d (0x%x)" % (assembly.data_offset, assembly.data_offset))
-            debug("  Data Size: %d (0x%x)" % (assembly.data_size, assembly.data_size))
-            debug("  Config Offset: %d (0x%x)" % (assembly.config_data_offset, assembly.config_data_offset))
-            debug("  Config Size: %d (0x%x)" % (assembly.config_data_size, assembly.config_data_size))
-            debug("  Debug Offset: %d (0x%x)" % (assembly.debug_data_offset, assembly.debug_data_offset))
-            debug("  Debug Size: %d (0x%x)" % (assembly.debug_data_size, assembly.debug_data_size))
-
-            i += 1
-
-        if not primary:
-            debug("Skipping hash sections in non-primary store")
-            return
-
-        # Parse Hash data
-        #
-        # The following 2 sections are _required_ to be in order from
-        # lowest to highest (e.g. 0x00000000 to 0xffffffff).
-        # Since you're very likely not going to be adding assemblies
-        # (or renaming) to the store, I'm going to store the hashes with the
-        # assemblies.json to make sorting easier when packing.
-
-        debug("Hash32 start at: %d (0x%x)" % (blob_file.tell(), blob_file.tell()))
-        self.global_hash32 = list()
-
-        i = 0
-        while i < self.hdr_lec:
-
-            entry = blob_file.read(20)
-
-            hash_entry = AssemblyStoreHashEntry()
-
-            hash_entry.hash_val = "0x%08x" % struct.unpack("<I", entry[0:4])[0]
-            hash_entry.mapping_index = struct.unpack("I", entry[8:12])[0]
-            hash_entry.local_store_index = struct.unpack("I", entry[12:16])[0]
-            hash_entry.store_id = struct.unpack("I", entry[16:20])[0]
-
-            debug("New Hash32 Section:")
-            debug("   mapping index: %d" % hash_entry.mapping_index)
-            debug("   local store index: %d" % hash_entry.local_store_index)
-            debug("   store id: %d" % hash_entry.store_id)
-            debug("   Hash32: %s" % hash_entry.hash_val)
-
-            self.global_hash32.append(hash_entry)
-
-            i += 1
-
-        debug("Hash64 start at: %d (0x%x)" % (blob_file.tell(), blob_file.tell()))
-        self.global_hash64 = list()
-
-        i = 0
-        while i < self.hdr_lec:
-
-            entry = blob_file.read(20)
-
-            hash_entry = AssemblyStoreHashEntry()
-
-            hash_entry.hash_val = "0x%016x" % struct.unpack("<Q", entry[0:8])[0]
-            hash_entry.mapping_index = struct.unpack("I", entry[8:12])[0]
-            hash_entry.local_store_index = struct.unpack("I", entry[12:16])[0]
-            hash_entry.store_id = struct.unpack("I", entry[16:20])[0]
-
-            debug("New Hash64 Section:")
-            debug("   mapping index: %d" % hash_entry.mapping_index)
-            debug("   local store index: %d" % hash_entry.local_store_index)
-            debug("   store id: %d" % hash_entry.store_id)
-            debug("   Hash64: %s" % hash_entry.hash_val)
-
-            self.global_hash64.append(hash_entry)
-
-            i += 1
-
-    def extract_all(self, json_config, outpath):
-
-        """Extract everything"""
-
-        # Start the config JSON
-        store_json = dict()
-        store_json[self.file_name] = dict()
-
-        # Set the JSON header data
-        store_json[self.file_name]['header'] = {'version': self.hdr_version,
-                                                'lec': self.hdr_lec,
-                                                'gec': self.hdr_gec,
-                                                'store_id': self.hdr_store_id}
-
-        i = 0
-        for assembly in self.assemblies_list:
-
-            # Set assembly JSON dictionary
-            assembly_dict = dict()
-
-            # Assume no compression
-            assembly_dict['lz4'] = False
-
-            assembly_data = ""
-
-            entry = self.manifest_entries.get_idx(self.hdr_store_id, i)
-
-            # Save hash/name/idx to JSON
-            assembly_dict['name'] = entry.name
-            assembly_dict['store_id'] = entry.blob_id
-            assembly_dict['blob_idx'] = entry.blob_idx
-            assembly_dict['hash32'] = entry.hash32
-            assembly_dict['hash64'] = entry.hash64
-
-            # Set and save outpath
-            out_file = "%s/%s.dll" % (outpath, entry.name)
-            assembly_dict['file'] = out_file
-
-            # Check if compressed, otherwise write
-            assembly_header = self.raw[assembly.data_offset:assembly.data_offset+4]
-            if assembly_header == constants.COMPRESSED_DATA_MAGIC:
-
-                assembly_data = self.decompress_lz4(self.raw[assembly.data_offset:
-                                                    assembly.data_offset
-                                                    + assembly.data_size])
-                assembly_dict['lz4'] = True
-                assembly_dict['lz4_desc_idx'] = struct.unpack('<I',
-                                                    self.raw[assembly.data_offset + 4:
-                                                    assembly.data_offset + 8])[0]
+import os
+import pathlib
+import struct
+import sys
+
+import lz4.block as lz4
+from elftools.elf.elffile import ELFFile
+
+from .v1 import do_pack, do_unpack
+
+
+# https://github.com/dotnet/android/blob/04340244c3cb1753a987b6809a91631dc883b035/tools/assembly-store-reader-mk2/AssemblyStore/StoreReader_V2.Classes.cs#L21
+class Header:
+    """
+    Header of AssemblyStore
+    """
+
+    def __init__(self, data):
+        (
+            self.magic,
+            self.version,
+            self.entry_count,
+            self.index_entry_count,
+            self.index_size,
+        ) = struct.unpack("<5I", data)
+
+
+# https://github.com/dotnet/android/blob/04340244c3cb1753a987b6809a91631dc883b035/tools/assembly-store-reader-mk2/AssemblyStore/StoreReader_V2.Classes.cs#L31
+# V3 change: https://github.com/dotnet/android/commit/aac59125f4f21002ade246f25eb2daaeb7909eda
+class IndexEntry:
+    """
+    Index entry of AssemblyStore
+    """
+
+    def __init__(self, data, is64Bit, version):
+        self.ignore = False
+        if version == 2:
+            if is64Bit:
+                self.name_hash, self.descriptor_index = struct.unpack("<QI", data)
             else:
-                assembly_data = self.raw[assembly.data_offset:
-                                         assembly.data_offset + assembly.data_size]
+                self.name_hash, self.descriptor_index = struct.unpack("<II", data)
+        elif version == 3:
+            if is64Bit:
+                self.name_hash, self.descriptor_index, ignore_byte = struct.unpack(
+                    "<QIB", data
+                )
+            else:
+                self.name_hash, self.descriptor_index, ignore_byte = struct.unpack(
+                    "<IIB", data
+                )
+            self.ignore = ignore_byte != 0
+        else:
+            raise ValueError(f"Unsupported AssemblyStore version: {version}")
 
-            print("Extracting %s..." % entry.name)
 
-            if not os.path.isdir(os.path.dirname(out_file)):
-                os.mkdir(os.path.dirname(out_file))
+# https://github.com/dotnet/android/blob/04340244c3cb1753a987b6809a91631dc883b035/tools/assembly-store-reader-mk2/AssemblyStore/StoreReader_V2.Classes.cs#L43
+class EntryDescriptor:
+    """
+    Entry descriptor of AssemblyStore
+    """
 
-            wfile = open(out_file, "wb")
+    def __init__(self, data):
+        (
+            self.mapping_index,
+            self.data_offset,
+            self.data_size,
+            self.debug_data_offset,
+            self.debug_data_size,
+            self.config_data_offset,
+            self.config_data_size,
+        ) = struct.unpack("<7I", data)
 
-            wfile.write(assembly_data)
-            wfile.close()
 
-            # Append to assemblies JSON
-            json_config['assemblies'].append(assembly_dict)
+def extract_payload(elf_path, output_file_path):
+    """
+    Extract payload from ELF file
+    """
 
-            i += 1
+    with open(elf_path, "rb") as elf_file:
+        elf = ELFFile(elf_file)
+        payload = elf.get_section_by_name("payload")
+        if payload is None:
+            print("No .payload section found")
+            exit(1)
+        if elf.header.e_machine == "EM_AARCH64":
+            is64Bit = True
+        elif elf.header.e_machine == "EM_ARM":
+            is64Bit = False
+        else:
+            print("Unsupported architecture")  # For now
+            exit(1)
+        payload_data = payload.data()
+        with open(output_file_path, "wb") as output_file:
+            output_file.write(payload_data)
+        return is64Bit
 
-        json_config['stores'].append(store_json)
-        return json_config
 
-    @classmethod
-    def decompress_lz4(cls, compressed_data):
+def extract_assemblies(payload_path, is64Bit, version):
+    """
+    Extract assemblies from payload
+    """
 
-        """Unpack an assembly if LZ4 packed"""
+    with open(payload_path, "rb") as payload_file:
+        # Read the header
+        header_data = payload_file.read(20)
+        header = Header(header_data)
 
-        # From: https://github.com/securitygrind/lz4_decompress
+        index_entries = []
+        for _ in range(header.index_entry_count):
+            if version == 2:
+                entry_size = 12 if is64Bit else 8
+            elif version == 3:
+                entry_size = 13 if is64Bit else 9
+            else:
+                raise ValueError(f"Unsupported AssemblyStore version: {version}")
 
-        packed_payload_len = compressed_data[8:12]
-        unpacked_payload_len = struct.unpack('<I', packed_payload_len)[0]
-        compressed_payload = compressed_data[12:]
+            index_entry_data = payload_file.read(entry_size)
+            index_entry = IndexEntry(index_entry_data, is64Bit, version)
+            index_entries.append(index_entry)
 
-        return lz4.block.decompress(compressed_payload,
-                                    uncompressed_size=unpacked_payload_len)
+        entry_descriptors = []
+        for _ in range(header.entry_count):
+            entry_descriptor_data = payload_file.read(28)
+            entry_descriptor = EntryDescriptor(entry_descriptor_data)
+            entry_descriptors.append(entry_descriptor)
+
+        assembly_names = []
+        for _ in range(header.entry_count):
+            name_length_data = payload_file.read(4)
+            name_length = struct.unpack("<I", name_length_data)[0]
+            name_data = payload_file.read(name_length)
+            assembly_names.append(name_data.decode("utf-8"))
+
+        assemblies = []
+        descriptor_indices = []
+
+        for descriptor in entry_descriptors:
+            if descriptor.data_size == 0:
+                assemblies.append(b"")
+                descriptor_indices.append(None)
+                continue
+
+            payload_file.seek(descriptor.data_offset)
+            assembly_data = payload_file.read(descriptor.data_size)
+            # print(descriptor.data_size, descriptor.data_offset)
+
+            desc_idx = None
+            # Unpack if LZ4 compressed
+            if assembly_data[:4] == b"XALZ":
+                desc_idx = struct.unpack("<I", assembly_data[4:8])[0]
+                packed_payload_len = struct.unpack("<I", assembly_data[8:12])[0]
+                compressed_payload = assembly_data[12:]
+                assembly_data = lz4.decompress(
+                    compressed_payload, uncompressed_size=packed_payload_len
+                )
+
+            assemblies.append(assembly_data)
+            descriptor_indices.append(desc_idx)
+
+        return (
+            assemblies,
+            entry_descriptors,
+            index_entries,
+            descriptor_indices,
+            assembly_names,
+        )
 
 
 def lz4_compress(file_data, desc_idx):
-
     """LZ4 compress data stream + add header"""
 
-    # 00 - 03: header XALZ
-    # 04 - 07: desc_index (not the same as idx?)
-    # 08 - 11: packed_payload_len
-    # 12 -  n: compressed data
-
-    packed = struct.pack("4sII",
-                         constants.COMPRESSED_DATA_MAGIC,
-                         desc_idx,
-                         len(file_data))
-
-    # https://github.com/xamarin/xamarin-android/blob/681887ebdbd192ce7ce1cd02221d4939599ba762/src/Xamarin.Android.Build.Tasks/Utilities/AssemblyCompression.cs#L81
-    compressed_data = lz4.block.compress(file_data, mode='high_compression',
-                                         store_size=False, compression=9)
-
+    packed = struct.pack("4sII", b"XALZ", desc_idx, len(file_data))
+    # Previously compression level was 9, https://github.com/AbhiTheModder/pyxamstore/blob/843b00da86ddee8a05541f63b1fd6855634a77bc/pyxamstore/__init__.py#L349
+    # Now it's 12
+    # see https://github.com/dotnet/android/blob/04340244c3cb1753a987b6809a91631dc883b035/src/Xamarin.Android.Build.Tasks/Utilities/AssemblyCompression.cs#L89
+    compressed_data = lz4.compress(
+        file_data, mode="high_compression", store_size=False, compression=12
+    )
     packed += compressed_data
-
     return packed
 
 
-def gen_xxhash(name, raw=False):
+def pack_elf(elf_path, payload_path, output_elf_path):
+    """
+    Pack payload into ELF
+    """
+    if not output_elf_path:
+        output_elf_path = elf_path
+    with open(elf_path, "rb") as elf_file:
+        elf_data = elf_file.read()
+        elf = ELFFile(elf_file)
+        if elf.header.e_machine == "EM_AARCH64":
+            is64Bit = True
+        elif elf.header.e_machine == "EM_ARM":
+            is64Bit = False
+        else:
+            raise ValueError("Unsupported ELF architecture")
 
-    """Generate xxhash32 + 64"""
+    with open(payload_path, "rb") as payload_file:
+        payload_data = payload_file.read()
 
-    h32 = xxhash.xxh32(seed=0)
-    h64 = xxhash.xxh64(seed=0)
+    elf_header = elf_data[:64]
+    if is64Bit:
+        e_shoff = struct.unpack_from("<Q", elf_header, 40)[0]
+        e_shnum = struct.unpack_from("<H", elf_header, 60)[0]
+        e_shentsize = struct.unpack_from("<H", elf_header, 58)[0]
+        e_shstrndx = struct.unpack_from("<H", elf_header, 62)[0]
+    else:
+        e_shoff = struct.unpack_from("<I", elf_header, 32)[0]
+        e_shnum = struct.unpack_from("<H", elf_header, 48)[0]
+        e_shentsize = struct.unpack_from("<H", elf_header, 46)[0]
+        e_shstrndx = struct.unpack_from("<H", elf_header, 50)[0]
 
-    h32.update(name)
-    h64.update(name)
+    section_headers = elf_data[e_shoff : e_shoff + e_shnum * e_shentsize]
+    if is64Bit:
+        shstrtab_offset = struct.unpack_from(
+            "<Q", section_headers, e_shstrndx * e_shentsize + 24
+        )[0]
+        shstrtab_size = struct.unpack_from(
+            "<Q", section_headers, e_shstrndx * e_shentsize + 32
+        )[0]
+    else:
+        shstrtab_offset = struct.unpack_from(
+            "<I", section_headers, e_shstrndx * e_shentsize + 16
+        )[0]
+        shstrtab_size = struct.unpack_from(
+            "<I", section_headers, e_shstrndx * e_shentsize + 20
+        )[0]
+    shstrtab = elf_data[shstrtab_offset : shstrtab_offset + shstrtab_size]
 
-    if raw:
-        return h32.digest()[::-1], h64.digest()[::-1]
+    payload_offset = None
+    payload_size = None
+    for i in range(e_shnum):
+        sh_name_offset = struct.unpack_from("<I", section_headers, i * e_shentsize + 0)[
+            0
+        ]
+        section_name = shstrtab[sh_name_offset:].split(b"\x00", 1)[0]
+        if section_name == b"payload":
+            if is64Bit:
+                payload_offset = struct.unpack_from(
+                    "<Q", section_headers, i * e_shentsize + 24
+                )[0]
+                payload_size = struct.unpack_from(
+                    "<Q", section_headers, i * e_shentsize + 32
+                )[0]
+            else:
+                payload_offset = struct.unpack_from(
+                    "<I", section_headers, i * e_shentsize + 16
+                )[0]
+                payload_size = struct.unpack_from(
+                    "<I", section_headers, i * e_shentsize + 20
+                )[0]
+            break
 
-    return h32.hexdigest(), h64.hexdigest()
+    if payload_offset is None or payload_size is None:
+        raise ValueError("Payload section not found in the ELF file")
 
+    new_elf_data = (
+        elf_data[:payload_offset]
+        + payload_data
+        + elf_data[payload_offset + payload_size :]
+    )
 
-def read_manifest(in_manifest):
-
-    """Read Manifest entries"""
-
-    manifest_list = ManifestList()
-    for line in open(in_manifest, "r").read().split("\n"):
-        if line == "" or len(line) == 0:
-            continue
-        if line[0:4] == "Hash":
-            continue
-
-        split_line = line.split()
-
-        manifest_list.append(ManifestEntry(split_line[0],   # hash32
-                                           split_line[1],   # hash64
-                                           split_line[2],   # blob_id
-                                           split_line[3],   # blob_idx
-                                           split_line[4]))  # name
-
-    return manifest_list
-
-
-def usage():
-
-    """Print usage"""
-
-    print("usage: pyxamstore MODE <args>")
-    print("")
-    print("   MODES:")
-    print("\tunpack <args>  Unpack assembly blobs.")
-    print("\tpack <args>    Repackage assembly blobs.")
-    print("\thash file_name Generate xxHash values.")
-    print("\thelp           Print this message.")
-
-    return 0
-
-
-def do_unpack(in_directory, in_arch, force):
-
-    """Unpack a assemblies.blob/manifest"""
-
-    arch_assemblies = False
-    in_directory = os.path.abspath(in_directory)
-    out_directory = os.path.join(in_directory, "out")
-
-    if force and os.path.isdir(out_directory):
-        shutil.rmtree(out_directory)
-
-    # First check if all files exist.
-    if os.path.isdir(out_directory):
-        print("Out directory already exists!")
-        return 3
-
-    manifest_path = os.path.join(in_directory, constants.FILE_ASSEMBLIES_MANIFEST)
-    assemblies_path = os.path.join(in_directory, constants.FILE_ASSEMBLIES_BLOB)
-
-    if not os.path.isfile(manifest_path):
-        print("Manifest file '%s' does not exist!" % manifest_path)
-        return 4
-    elif not os.path.isfile(assemblies_path):
-        print("Main assemblies blob '%s' does not exist!" % assemblies_path)
-        return 4
-
-    # The manifest will have all entries (regardless of which
-    # *.blob they're found in. Parse this first, and then handle
-    # each blob.
-
-    manifest_entries = read_manifest(manifest_path)
-    if manifest_entries is None:
-        print("Unable to parse assemblies.manifest file!")
-        return 5
-
-    json_data = dict()
-    json_data['stores'] = list()
-    json_data['assemblies'] = list()
-
-    os.mkdir(out_directory)
-
-    assembly_store = AssemblyStore(assemblies_path, manifest_entries)
-
-    if assembly_store.hdr_lec != assembly_store.hdr_gec:
-        arch_assemblies = True
-        debug("There are more assemblies to unpack here!")
-
-    # Do extraction.
-    json_data = assembly_store.extract_all(json_data, out_directory)
-
-    # What about architecture assemblies?
-    if arch_assemblies:
-        arch_assemblies_path = os.path.join(in_directory,
-                                            constants.ARCHITECTURE_MAP[in_arch])
-
-        arch_assembly_store = AssemblyStore(arch_assemblies_path,
-                                            manifest_entries,
-                                            primary=False)
-        json_data = arch_assembly_store.extract_all(json_data, out_directory)
-
-    # Save the large config out.
-    with open(os.path.join(in_directory, constants.FILE_ASSEMBLIES_JSON), 'w') as assembly_file:
-        assembly_file.write(json.dumps(json_data, indent=4))
-
-def do_pack(in_json_config):
-
-    """Create new assemblies.blob/manifest"""
-
-    if not os.path.isfile(in_json_config):
-        print("Config file '%s' does not exist!" % in_json_config)
-        return -1
-
-    if os.path.isfile("assemblies.manifest.new"):
-        print("Output manifest exists!")
-        return -2
+    with open(output_elf_path, "wb") as output_file:
+        output_file.write(new_elf_data)
 
 
-    if os.path.isfile("assemblies.blob.new"):
-        print("Output blob exists!")
-        return -3
+def update_payload(config_file, payload_path, assembly_folder):
+    """
+    Update payload with assemblies from assembly_folder
+    """
+    try:
+        with open(config_file, "r") as f:
+            config = json.load(f)
 
-    json_data = None
-    with open(in_json_config, "r") as json_f:
-        json_data = json.load(json_f)
-
-    # Write new assemblies.manifest
-    print("Writing 'assemblies.manifest.new'...")
-    assemblies_manifest_f = open("assemblies.manifest.new", "w")
-
-    assemblies_manifest_f.write("Hash 32     Hash 64             ")
-    assemblies_manifest_f.write("Blob ID  Blob idx  Name\r\n")
-
-    #for _, store_json in json_data['stores'].items():
-    for assembly in json_data['assemblies']:
-        hash32, hash64 = gen_xxhash(assembly['name'])
-
-        line = ("0x%08s  0x%016s  %03d      %04d      %s\r\n"
-                % (hash32, hash64, assembly['store_id'],
-                   assembly['blob_idx'], assembly['name']))
-
-        assemblies_manifest_f.write(line)
-
-    assemblies_manifest_f.close()
-
-    # This is hacky, but we need the lec/gec if there are multiple stores.
-    store_zero_lec = 0
-    for assembly_store in json_data['stores']:
-        for store_name, store_data in list(assembly_store.items()):
-            if store_name == "assemblies.blob":
-                store_zero_lec = store_data['header']['lec']
-
-    # Next do the blobs.
-    for assembly_store in json_data['stores']:
-        for store_name, store_data in list(assembly_store.items()):
-
-            out_store_name = "%s.new" % store_name
-
-            # Pack the new AssemblyStore structure
-            print("Writing '%s'..." % out_store_name)
-            assemblies_blob_f = open(out_store_name, "wb")
-
-            # Write header
-            json_hdr = store_data['header']
-            assemblies_blob_f.write(struct.pack("4sIIII",
-                                                constants.ASSEMBLY_STORE_MAGIC,
-                                                json_hdr['version'],
-                                                json_hdr['lec'],
-                                                json_hdr['gec'],
-                                                json_hdr['store_id']))
-
-            # Offsets are weird.
-            # If this is a primary store, the data is:
-            #  -header
-            #  -ASA header
-            #  -hash32
-            #  -hash64
-            #  -ASA data
-            # But a non-primary does not have hashes. Best to determine early
-            # if this is primary and act accordingly throughout.
-            primary = bool(json_hdr['store_id'] == 0)
-
-            next_entry_offset = 20
-            next_data_offset = 20 + (json_hdr['lec'] * 24) + (json_hdr['gec'] * 40)
-
-            if not primary:
-                next_data_offset = 20 + (json_hdr['lec'] * 24)
-
-            # First pass: Write the entries + DLL content.
-            for assembly in json_data['assemblies']:
-
-                if assembly['store_id'] != json_hdr['store_id']:
-                    debug("Skipping assembly for another store")
+        with open(payload_path, "r+b") as payload:
+            for assembly, info in config.items():
+                if info.get("ignored", False):
+                    print(f"Skipping ignored assembly: {assembly}")
                     continue
 
-                assembly_data = open(assembly['file'], "rb").read()
-                if assembly['lz4']:
-                    assembly_data = lz4_compress(assembly_data,
-                                                 assembly['lz4_desc_idx'])
+                assembly_path = os.path.join(assembly_folder, assembly)
 
-                data_size = len(assembly_data)
+                if not os.path.exists(assembly_path):
+                    print(f"Warning: {assembly_path} does not exist. Skipping...")
+                    continue
 
-                # Write the entry data
-                assemblies_blob_f.seek(next_entry_offset)
-                assemblies_blob_f.write(struct.pack("IIIIII",
-                                                    next_data_offset,
-                                                    data_size,
-                                                    0, 0, 0, 0))
+                with open(assembly_path, "rb") as asm_file:
+                    assembly_data = asm_file.read()
+                    if assembly_data[:2] == b"MZ":
+                        compressed_data = lz4_compress(assembly_data, info["idx"])
+                        assembly_data = compressed_data
+                    elif assembly_data[:4] == b"XALZ":
+                        pass
+                    else:
+                        print(
+                            f"Error: {assembly} is not a valid PE or XALZ file. Skipping."
+                        )
+                        continue
 
-                # Write binary data
-                assemblies_blob_f.seek(next_data_offset)
-                assemblies_blob_f.write(assembly_data)
+                # Size shouldn't change much else xamarin will crash with an
+                # Abort message:'Compressed assembly
+                # '<assembly_store>' is larger than when the
+                # application was built (expected at most 2560, got
+                # 1893376). Assemblies don't grow just like that!'
+                # TODO: Maybe support upto some size ?
+                if len(assembly_data) > info["size"]:
+                    print(f"Error: {assembly} exceeds the allocated size. Skipping.")
+                    continue
 
-                # Move all offsets forward.
-                next_data_offset += data_size
-                next_entry_offset += 24
+                payload.seek(info["offset"])
 
-            # Second + third pass: sort the hashes and write them
-            # But skip if not primary.
-            if not primary:
-                assemblies_blob_f.close()
-                continue
+                payload.write(assembly_data)
+                print(f"{assembly} updated in {payload_path}.")
 
-            next_hash32_offset = 20 + (json_hdr['lec'] * 24)
-            next_hash64_offset = 20 + (json_hdr['lec'] * 24) + (json_hdr['gec'] * 20)
-
-            assembly_data = json_data["assemblies"]
-
-            # hash32
-            for assembly in sorted(assembly_data, key=lambda d: d['hash32']):
-
-                # Hash sections
-                hash32, hash64 = gen_xxhash(assembly['name'], raw=True)
-                mapping_id = assembly['blob_idx'] if assembly['store_id'] == 0 else store_zero_lec + assembly['blob_idx']
-
-                # Write the hash32
-                assemblies_blob_f.seek(next_hash32_offset)
-                assemblies_blob_f.write(struct.pack("4sIIII",
-                                                    hash32,
-                                                    0,
-                                                    mapping_id,
-                                                    assembly['blob_idx'],
-                                                    assembly['store_id']))
-
-                next_hash32_offset += 20
-
-            # hash64
-            for assembly in sorted(assembly_data, key=lambda d: d['hash64']):
-
-                # Hash sections
-                hash32, hash64 = gen_xxhash(assembly['name'], raw=True)
-                mapping_id = assembly['blob_idx'] if assembly['store_id'] == 0 else store_zero_lec + assembly['blob_idx']
-
-                # Write the hash64
-                assemblies_blob_f.seek(next_hash64_offset)
-                assemblies_blob_f.write(struct.pack("8sIII",
-                                                    hash64,
-                                                    mapping_id,
-                                                    assembly['blob_idx'],
-                                                    assembly['store_id']))
-
-                next_hash64_offset += 20
-
-            # Done!
-            assemblies_blob_f.close()
-
-    return 0
+    except Exception as e:
+        print(f"An error occurred: {e}")
 
 
-def unpack_store(args):
+def unpack_payload(payload_path: str, assembly_out: str, arch: str | None = None):
+    print("Verifying payload...")
+    with open(payload_path, "rb") as payload_file:
+        header_data = payload_file.read(20)
+        if header_data[:4] != b"XABA":
+            raise ValueError("Payload is not valid!")
 
-    """Unpack an assemblies store"""
+        print("Payload is valid!")
+        header = Header(header_data)
 
-    parser = argparse.ArgumentParser(prog='pyxamstore unpack',
-                                     description='Unpack DLLs from assemblies.blob store.')
-    parser.add_argument('--dir', '-d', type=str, metavar='val',
-                        default='./',
-                        dest='directory',
-                        help='Where to load blobs/manifest from.')
-    parser.add_argument('--arch', '-a', type=str, metavar='val',
-                        default='arm64',
-                        dest='architecture',
-                        help='Which architecture to unpack: arm(64), x86(_64)')
-    parser.add_argument('--force', '-f', action='store_const',
-                        dest='force', const=True, default=False,
-                        help="Force re-create out/ directory.")
+        # The base version (2 or 3) is in the lowest byte.
+        version = header.version & 0xFF
+        is64Bit = (header.version & 0x80000000) != 0
 
-    parsed_args = parser.parse_args(args)
+        if version not in [1, 2, 3]:
+            raise ValueError(f"Unsupported AssemblyStore version: {version}")
 
-    return do_unpack(parsed_args.directory,
-                     parsed_args.architecture,
-                     parsed_args.force)
+    if version == 1:
+        print(f"Detected AssemblyStore v{version}.")
+        payload_dir = os.path.dirname(payload_path)
+        do_unpack(payload_dir, arch, True)
+    else:
+        print(
+            f"Detected AssemblyStore v{version} for {'64-bit' if is64Bit else '32-bit'} architecture."
+        )
+        (
+            assemblies,
+            entry_descriptors,
+            index_entries,
+            descriptor_indices,
+            assembly_names,
+        ) = extract_assemblies(payload_path, is64Bit, version)
+
+        is_ignored_map = {}
+        for entry in index_entries:
+            is_ignored_map[entry.descriptor_index] = entry.ignore
+
+        config_data = {}
+        for i, (assembly, descriptor, desc_idx, real_name) in enumerate(
+            zip(assemblies, entry_descriptors, descriptor_indices, assembly_names)
+        ):
+            assembly_name = real_name if real_name else f"assembly_{i}.dll"
+            ignored = is_ignored_map.get(i, False)
+
+            if not ignored and assembly:
+                dest_path = os.path.join(assembly_out, assembly_name)
+                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                with open(dest_path, "wb") as assembly_file:
+                    assembly_file.write(assembly)
+
+            idx_to_store = (
+                desc_idx if desc_idx is not None else descriptor.mapping_index
+            )
+            config_data[assembly_name] = {
+                "idx": idx_to_store,
+                "offset": descriptor.data_offset,
+                "size": descriptor.data_size,
+                "ignored": ignored,
+            }
+        with open(
+            os.path.join(assembly_out, "assembly_config.json"), "w"
+        ) as config_json:
+            json.dump(config_data, config_json, indent=4)
+
+    print("Assemblies extracted successfully!")
+    return
 
 
-def pack_store(args):
+def unpack_elf(
+    elf_path: pathlib.Path, out_dir: None | pathlib.Path = None, arch: str | None = None
+):
+    """
+    Function to unpack and extract payload & assemblies from an ELF file
+    """
+    if not out_dir:
+        out_dir = elf_path.with_name(f"{elf_path.stem}_extracted")
 
-    """Pack an assemblies store"""
+    payload_path = out_dir / "payload.bin"
+    assembly_out = out_dir / "out"
 
-    parser = argparse.ArgumentParser(prog='pyxamstore pack',
-                                     description='Repackage DLLs into assemblies.blob.')
-    parser.add_argument('--config', '-c', type=str, metavar='val',
-                        default='assemblies.json',
-                        dest='config_json',
-                        help='Input assemblies.json file.')
+    if elf_path.name.endswith(".blob"):
+        payload_path = elf_path
+    else:
+        os.makedirs(assembly_out, exist_ok=True)
+        extract_payload(str(elf_path), str(payload_path))
+        print(f"Payload extracted to {payload_path}")
 
-    parsed_args = parser.parse_args(args)
+    unpack_payload(str(payload_path), str(assembly_out), arch)
 
-    if not os.path.isfile(parsed_args.config_json):
-        print("File '%s' doesn't exist!" % parsed_args.config_json)
-        return -3
-
-    return do_pack(parsed_args.config_json)
-
-
-def gen_hash(args):
-
-    """Generate xxhashes for a given file path/string, mostly for testing"""
-
-    if len(args) < 1:
-        print("Need to provide a string to hash!")
-        return -1
-
-    file_name = args.pop(0)
-    hash_name = os.path.splitext(os.path.basename(file_name))[0]
-
-    print("Generating hashes for string '%s' (%s)" % (file_name, hash_name))
-    hash32, hash64 = gen_xxhash(hash_name)
-
-    print("Hash32: 0x%s" % hash32)
-    print("Hash64: 0x%s" % hash64)
-
-    return 0
+    return out_dir
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Pack/unpack Xamarin AssemblyStore payloads."
+    )
+    parser.add_argument(
+        "elf_path",
+        help="Path to the ELF file to operate on; in case of V1 format, it should be path to the assemblies.blob file.",
+    )
+    parser.add_argument(
+        "extracted_dir",
+        nargs="?",
+        help="Directory created by a previous --unpack/-u (used for --pack/-p); in case of V1 format, it should be path to the assemblies.json (config) file.",
+    )
+    parser.add_argument(
+        "--out-path",
+        "-o",
+        help=(
+            "Path for output: when unpacking, directory to place extracted files "
+            "(default: <elf>_extracted); when packing, path for the re‑packed ELF "
+            "(default: overwrite original ELF)."
+        ),
+    )
+    parser.add_argument(
+        "--arch",
+        "-r",
+        type=str,
+        metavar="val",
+        default="arm64",
+        help="Which architecture to unpack: arm(64), x86(_64) (default: arm64); Only to be used with V1 format. V2 & V3 format doesn't need this",
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--unpack", "-u", action="store_true", help="Extract assemblies")
+    group.add_argument(
+        "--pack",
+        "-p",
+        action="store_true",
+        help="Re‑pack assemblies",
+    )
 
-    """Main Loop"""
+    args = parser.parse_args()
+    out_path = pathlib.Path(args.out_path) if args.out_path else None
 
-    if len(sys.argv) < 2:
-        print("Mode is required!")
-        usage()
-        return -1
+    if args.unpack:
+        elf_path = pathlib.Path(args.elf_path)
+        unpack_dir = unpack_elf(elf_path, out_path, args.arch)
+        print(f"All files placed in: {unpack_dir}")
 
-    sys.argv.pop(0)
-    mode = sys.argv.pop(0)
+    elif args.pack:
+        if not args.extracted_dir:
+            parser.error("--pack/-p requires the extracted directory argument")
+        extracted_path = pathlib.Path(args.extracted_dir)
 
-    if mode == "unpack":
-        return unpack_store(sys.argv)
-    elif mode == "pack":
-        return pack_store(sys.argv)
-    elif mode == "hash":
-        return gen_hash(sys.argv)
-    elif mode in ['-h', '--h', 'help']:
-        return usage()
+        if str(args.elf_path).endswith(".blob"):
+            with open(args.elf_path, "rb") as payload_file:
+                header_data = payload_file.read(20)
+                if header_data[:4] != b"XABA":
+                    raise ValueError("blob is not valid!")
 
-    print("Unknown mode: '%s'" % mode)
-    return -2
+                header = Header(header_data)
+                version = header.version & 0xFF
+            if version == 1:
+                if not extracted_path.name.endswith(".json"):
+                    exit("extracted_path must be the path to config path for V1 format")
+                do_pack(str(extracted_path))
+                return
+
+        payload_path = extracted_path / "payload.bin"
+        config_path = extracted_path / "out" / "assembly_config.json"
+        assembly_folder = extracted_path / "out"
+
+        if not payload_path.is_file() or not config_path.is_file():
+            sys.exit(
+                f"Missing payload or config in {extracted_path}. "
+                "Run the tool with --unpack/-u first."
+            )
+
+        update_payload(str(config_path), str(payload_path), str(assembly_folder))
+
+        pack_elf(args.elf_path, str(payload_path), str(out_path))
+        print(f"Re‑packed ELF written to {out_path}")
 
 
 if __name__ == "__main__":
