@@ -8,10 +8,11 @@
 import argparse
 import json
 import os
+import pathlib
 import struct
 import sys
 
-import lz4.block
+import lz4.block as lz4
 from elftools.elf.elffile import ELFFile
 
 
@@ -149,7 +150,7 @@ def extract_assemblies(payload_path, is64Bit, version):
                 desc_idx = struct.unpack("<I", assembly_data[4:8])[0]
                 packed_payload_len = struct.unpack("<I", assembly_data[8:12])[0]
                 compressed_payload = assembly_data[12:]
-                assembly_data = lz4.block.decompress(
+                assembly_data = lz4.decompress(
                     compressed_payload, uncompressed_size=packed_payload_len
                 )
 
@@ -166,7 +167,7 @@ def lz4_compress(file_data, desc_idx):
     # Previously compression level was 9, https://github.com/AbhiTheModder/pyxamstore/blob/843b00da86ddee8a05541f63b1fd6855634a77bc/pyxamstore/__init__.py#L349
     # Now it's 12
     # see https://github.com/dotnet/android/blob/04340244c3cb1753a987b6809a91631dc883b035/src/Xamarin.Android.Build.Tasks/Utilities/AssemblyCompression.cs#L89
-    compressed_data = lz4.block.compress(
+    compressed_data = lz4.compress(
         file_data, mode="high_compression", store_size=False, compression=12
     )
     packed += compressed_data
@@ -177,6 +178,8 @@ def pack_elf(elf_path, payload_path, output_elf_path):
     """
     Pack payload into ELF
     """
+    if not output_elf_path:
+        output_elf_path = elf_path
     with open(elf_path, "rb") as elf_file:
         elf_data = elf_file.read()
         elf = ELFFile(elf_file)
@@ -308,7 +311,7 @@ def update_payload(config_file, payload_path, assembly_folder):
         print(f"An error occurred: {e}")
 
 
-def unpack_payload(payload_path):
+def unpack_payload(payload_path: str, assembly_out: str):
     print("Verifying payload...")
     with open(payload_path, "rb") as payload_file:
         header_data = payload_file.read(20)
@@ -344,7 +347,7 @@ def unpack_payload(payload_path):
         ignored = is_ignored_map.get(i, False)
 
         if not ignored and assembly:
-            with open(os.path.join("out", assembly_name), "wb") as assembly_file:
+            with open(os.path.join(assembly_out, assembly_name), "wb") as assembly_file:
                 assembly_file.write(assembly)
 
         idx_to_store = desc_idx if desc_idx is not None else descriptor.mapping_index
@@ -354,60 +357,87 @@ def unpack_payload(payload_path):
             "size": descriptor.data_size,
             "ignored": ignored,
         }
-    with open(os.path.join("out", "assembly_config.json"), "w") as config_json:
+    with open(os.path.join(assembly_out, "assembly_config.json"), "w") as config_json:
         json.dump(config_data, config_json, indent=4)
 
     print("Assemblies extracted successfully!")
     return
 
 
-def unpack_elf(elf_path, out="out", payload="payload.bin"):
+def unpack_elf(elf_path: pathlib.Path, out_dir: None | pathlib.Path = None):
     """
     Function to unpack and extract payload & assemblies from an ELF file
     """
-    os.makedirs(out, exist_ok=True)
-    extract_payload(elf_path, payload)
-    print(f"Payload extracted to {payload}")
-    unpack_payload(payload)
-    return
+    if not out_dir:
+        out_dir = elf_path.with_name(f"{elf_path.stem}_extracted")
+
+    payload_path = out_dir / "payload.bin"
+    assembly_out = out_dir / "out"
+
+    os.makedirs(assembly_out, exist_ok=True)
+
+    extract_payload(str(elf_path), str(payload_path))
+    print(f"Payload extracted to {payload_path}")
+
+    unpack_payload(str(payload_path), str(assembly_out))
+
+    return out_dir
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--elf", help="Path to the input ELF file")
-    parser.add_argument("--unpack", action="store_true", help="Unpack the ELF file")
+    parser = argparse.ArgumentParser(
+        description="Pack/unpack Xamarin AssemblyStore payloads."
+    )
+    parser.add_argument("elf_path", help="Path to the ELF file to operate on")
     parser.add_argument(
-        "--pack",
-        metavar=("ELF_PATH", "PAYLOAD_PATH", "OUTPUT_ELF_PATH"),
-        nargs=3,
-        help="Pack the ELF file with a new payload",
+        "extracted_dir",
+        nargs="?",
+        help="Directory created by a previous --unpack/-u (used for --pack/-p)",
     )
     parser.add_argument(
-        "--update",
-        metavar=("CONFIG_FILE", "PAYLOAD_PATH", "ASSEMBLY_FOLDER"),
-        nargs=3,
-        help="Update the payload with modified assembly files",
+        "--out-path",
+        "-o",
+        help=(
+            "Path for output: when unpacking, directory to place extracted files "
+            "(default: <elf>_extracted); when packing, path for the re‑packed ELF "
+            "(default: overwrite original ELF)."
+        ),
     )
-    parser.add_argument(
-        "--payload", metavar=("PAYLOAD_PATH"), nargs=1, help="Unpack payload"
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        "--unpack", "-u", action="store_true", help="Extract payload & assemblies"
     )
+    group.add_argument(
+        "--pack", "-p", action="store_true", help="Re‑pack payload & ELF from extracted_dir"
+    )
+
     args = parser.parse_args()
+    out_path = pathlib.Path(args.out_path) if args.out_path else None
 
     if args.unpack:
-        if not args.elf:
-            print("Please provide an ELF file path for unpacking.")
-            sys.exit(1)
-        else:
-            unpack_elf(args.elf)
+        elf_path = pathlib.Path(args.elf_path)
+        unpack_dir = unpack_elf(elf_path, out_path)
+        print(f"All files placed in: {unpack_dir}")
+
     elif args.pack:
-        pack_elf(args.pack[0], args.pack[1], args.pack[2])
-    elif args.update:
-        update_payload(args.update[0], args.update[1], args.update[2])
-    elif args.payload:
-        unpack_payload(args.payload[0])
-    else:
-        print("Please specify either --unpack, --pack, or --update.")
-        sys.exit(1)
+        if not args.extracted_dir:
+            parser.error("--pack/-p requires the extracted directory argument")
+        extracted_path = pathlib.Path(args.extracted_dir)
+
+        payload_path = extracted_path / "payload.bin"
+        config_path = extracted_path / "out" / "assembly_config.json"
+        assembly_folder = extracted_path / "out"
+
+        if not payload_path.is_file() or not config_path.is_file():
+            sys.exit(
+                f"Missing payload or config in {extracted_path}. "
+                "Run the tool with --unpack/-u first."
+            )
+
+        update_payload(str(config_path), str(payload_path), str(assembly_folder))
+
+        pack_elf(args.elf_path, str(payload_path), str(out_path))
+        print(f"Re‑packed ELF written to {out_path}")
 
 
 if __name__ == "__main__":
