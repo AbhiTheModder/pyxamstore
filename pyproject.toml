@@ -16,9 +16,8 @@ keywords = [
 ]
 
 classifiers = [
-    'Development Status :: 3 - Alpha',
+    'Development Status :: 5 - Production/Stable',
     'Natural Language :: English',
-    'License :: OSI Approved :: MIT License',
     'Programming Language :: Python',
     'Programming Language :: Python :: 3',
     'Programming Language :: Python :: 3.6',
@@ -27,12 +26,14 @@ classifiers = [
     'Programming Language :: Python :: 3.9',
     'Programming Language :: Python :: 3.10',
     'Programming Language :: Python :: 3.11',
+    'Programming Language :: Python :: 3.12',
+    'Programming Language :: Python :: 3.13',
 ]
 license = "MIT"
 readme = "README.md"
-homepage = "https://github.com/jakev/pyxamstore"
-repository = "https://github.com/jakev/pyxamstore"
-documentation = "https://github.com/jakev/pyxamstore"
+homepage = "https://github.com/AbhiTheModder/pyxamstore"
+repository = "https://github.com/AbhiTheModder/pyxamstore"
+documentation = "https://github.com/AbhiTheModder/pyxamstore"
 
 [tool.poetry.dependencies]
 python = "^3.6"
