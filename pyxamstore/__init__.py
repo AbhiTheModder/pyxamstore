@@ -131,6 +131,13 @@ def extract_assemblies(payload_path, is64Bit, version):
             entry_descriptor = EntryDescriptor(entry_descriptor_data)
             entry_descriptors.append(entry_descriptor)
 
+        assembly_names = []
+        for _ in range(header.entry_count):
+            name_length_data = payload_file.read(4)
+            name_length = struct.unpack("<I", name_length_data)[0]
+            name_data = payload_file.read(name_length)
+            assembly_names.append(name_data.decode("utf-8"))
+
         assemblies = []
         descriptor_indices = []
 
@@ -157,7 +164,13 @@ def extract_assemblies(payload_path, is64Bit, version):
             assemblies.append(assembly_data)
             descriptor_indices.append(desc_idx)
 
-        return assemblies, entry_descriptors, index_entries, descriptor_indices
+        return (
+            assemblies,
+            entry_descriptors,
+            index_entries,
+            descriptor_indices,
+            assembly_names,
+        )
 
 
 def lz4_compress(file_data, desc_idx):
@@ -331,7 +344,7 @@ def unpack_payload(payload_path: str, assembly_out: str):
     print(
         f"Detected AssemblyStore v{version} for {'64-bit' if is64Bit else '32-bit'} architecture."
     )
-    assemblies, entry_descriptors, index_entries, descriptor_indices = (
+    assemblies, entry_descriptors, index_entries, descriptor_indices, assembly_names = (
         extract_assemblies(payload_path, is64Bit, version)
     )
 
@@ -340,14 +353,16 @@ def unpack_payload(payload_path: str, assembly_out: str):
         is_ignored_map[entry.descriptor_index] = entry.ignore
 
     config_data = {}
-    for i, (assembly, descriptor, desc_idx) in enumerate(
-        zip(assemblies, entry_descriptors, descriptor_indices)
+    for i, (assembly, descriptor, desc_idx, real_name) in enumerate(
+        zip(assemblies, entry_descriptors, descriptor_indices, assembly_names)
     ):
-        assembly_name = f"assembly_{i}.dll"
+        assembly_name = real_name if real_name else f"assembly_{i}.dll"
         ignored = is_ignored_map.get(i, False)
 
         if not ignored and assembly:
-            with open(os.path.join(assembly_out, assembly_name), "wb") as assembly_file:
+            dest_path = os.path.join(assembly_out, assembly_name)
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            with open(dest_path, "wb") as assembly_file:
                 assembly_file.write(assembly)
 
         idx_to_store = desc_idx if desc_idx is not None else descriptor.mapping_index
@@ -408,7 +423,10 @@ def main():
         "--unpack", "-u", action="store_true", help="Extract payload & assemblies"
     )
     group.add_argument(
-        "--pack", "-p", action="store_true", help="Re‑pack payload & ELF from extracted_dir"
+        "--pack",
+        "-p",
+        action="store_true",
+        help="Re‑pack payload & ELF from extracted_dir",
     )
 
     args = parser.parse_args()
