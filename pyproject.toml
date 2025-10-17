@@ -2,7 +2,7 @@
 name = "pyxamstore"
 version = "2.0.0"
 description = "Python utility for parsing Xamarin AssemblyStoreV2 blob files"
-authors = ["AbhiTheModder"]
+authors = ["jakev", "AbhiTheModder"]
 keywords = [
     "android",
     "device",
